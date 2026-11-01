@@ -1,0 +1,52 @@
+# ── Окружение и секреты ─────────────────────────────
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# ── Python: кэш и сборка ────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# ── Записи встреч (регистр расширений неважен: .wav и .WAV) ──
+data/audio/*
+!data/audio/.gitkeep
+*.[wW][aA][vV]
+*.[mM][pP]3
+*.[mM]4[aA]
+*.[fF][lL][aA][cC]
+*.[oO][gG][gG]
+*.[aA][aA][cC]
+*.[wW][eE][bB][mM]
+
+# ── Результаты и локальная история ──────────────────
+data/output/*
+!data/output/.gitkeep
+data/history/*
+!data/history/.gitkeep
+# выгруженные модели Whisper/HF
+*.safetensors
+*.gguf
+
+# ── Локальные данные БД ─────────────────────────────
+pgdata/
+*.sqlite
+*.sqlite3
+*.db
+
+# ── IDE и ОС ────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp

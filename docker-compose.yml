@@ -1,0 +1,53 @@
+# docker compose up -d            — PostgreSQL + сервис
+# docker compose up -d postgres   — только PostgreSQL (сервис запускается на хосте, см. docs/RUNNING.md)
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-audio}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-audio}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-audio}
+      # Ollama запущена на хосте
+      ollama_url: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL_NAME: ${OLLAMA_MODEL_NAME:-qwen3.5:4b}
+      ASSISTANT_WHISPER_MODEL: ${WHISPER_MODEL:-large-v3-turbo}
+      ASSISTANT_DEFAULT_AUDIENCE: ${ASSISTANT_DEFAULT_AUDIENCE:-management}
+      ASSISTANT_ATTRIBUTION_METHOD: ${ASSISTANT_ATTRIBUTION_METHOD:-llm}
+      ASSISTANT_ATTRIBUTION_CHUNK_CHARS: ${ASSISTANT_ATTRIBUTION_CHUNK_CHARS:-6000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # на Linux; Docker Desktop знает это имя сам
+    volumes:
+      - ./data:/app/data                      # audio/ — вход, output/ — результаты
+      - ./config:/app/config:ro               # team.yaml читается при старте: после правки restart
+      - ./prompts:/app/prompts:ro             # промпты читаются на каждый запрос: рестарт не нужен
+      - hf_cache:/root/.cache/huggingface     # модель Whisper скачивается один раз
+
+volumes:
+  pgdata:
+  hf_cache:

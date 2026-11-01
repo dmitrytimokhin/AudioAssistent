@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: 'RAG Service Dashboards'
+    orgId: 1
+    folder: 'RAG Service'
+    folderUid: 'rag-service'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

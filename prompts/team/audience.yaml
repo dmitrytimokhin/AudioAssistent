@@ -1,0 +1,5 @@
+header: "Заметки по дейли {date}"
+project_header: "Проект {project}"
+item: "{full_name}: {text}"
+date_format: "%d.%m.%Y"
+empty_text: "-"

@@ -1,0 +1,30 @@
+[project]
+name = "audio-assistant"
+version = "1.0.0"
+description = "Сервис: аудио встречи -> транскрипт -> атрибуция говорящих -> статус для руководства"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi", "uvicorn", "python-multipart", "pydantic-settings", "pyyaml", "requests",
+    "sqlalchemy>=2", "psycopg2-binary",
+    "structlog", "prometheus-client",
+    "opentelemetry-api", "opentelemetry-sdk", "opentelemetry-exporter-otlp-proto-http",
+]
+
+[project.optional-dependencies]
+mlx = ["mlx-whisper"]          # быстрый Whisper на Apple Silicon (рекомендуется)
+faster = ["faster-whisper", "av<17"]    # CPU-вариант; PyAV 17+ убрал metadata_errors, который передаёт faster-whisper 1.2.1
+dev = ["pytest", "httpx", "jupyter", "ipykernel"]
+
+[project.scripts]
+audio-assistant = "audio_assistant.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["audio_assistant*", "app*", "observability*", "ollama_client*", "postgres_client*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
