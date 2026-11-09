@@ -30,13 +30,15 @@ class MeetingRun(Base):
     meeting_date: Mapped[date] = mapped_column(Date, nullable=False)
     recorded_at: Mapped[datetime | None] = mapped_column(DateTime)  # из имени файла, локальное время записи
     source: Mapped[str] = mapped_column(Text, default="")
+    kind: Mapped[str | None] = mapped_column(String(32))          # тип встречи: config/meeting_kinds.yaml
+    tags: Mapped[list] = mapped_column(JsonType, default=list)    # произвольные пометки
     # created -> transcribed -> attributed -> summarized -> reported | error
     status: Mapped[str] = mapped_column(String(16), default="created")
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
-    __table_args__ = (Index("ix_meeting_runs_date", "meeting_date"),)
+    __table_args__ = (Index("ix_meeting_runs_date", "meeting_date"), Index("ix_meeting_runs_kind", "kind"))
 
 
 class TranscriptRecord(Base):
@@ -115,5 +117,64 @@ class LLMCall(Base):
     response: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(16), nullable=False)  # success | error
     error: Mapped[str | None] = mapped_column(Text)
+    duration_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class Analysis(Base):
+    """Разбор встречи промптом из prompts/meetings/<prompt_name>/ (повтор заменяет прежний)."""
+
+    __tablename__ = "analyses"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("meeting_runs.id", ondelete="CASCADE"))
+    prompt_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(16), default="dialogue")   # dialogue | raw
+    model: Mapped[str] = mapped_column(String(128), default="")
+    chunks: Mapped[int] = mapped_column(Integer, default=1)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    __table_args__ = (UniqueConstraint("run_id", "prompt_name", name="uq_analyses_run_prompt"),)
+
+
+class Digest(Base):
+    """Сводка по нескольким встречам за период (таблица для Excel). Не привязана к одному запуску."""
+
+    __tablename__ = "digests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)       # папка prompts/digests/<name>
+    title: Mapped[str] = mapped_column(Text, default="")
+    date_from: Mapped[date] = mapped_column(Date, nullable=False)
+    date_to: Mapped[date] = mapped_column(Date, nullable=False)
+    kinds: Mapped[list] = mapped_column(JsonType, default=list)
+    tags: Mapped[list] = mapped_column(JsonType, default=list)
+    source: Mapped[str] = mapped_column(String(16), default="dialogue")
+    status: Mapped[str] = mapped_column(String(16), default="running")  # running | done | error
+    error: Mapped[str | None] = mapped_column(Text)
+    done: Mapped[int] = mapped_column(Integer, default=0)               # встреч обработано
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    headers: Mapped[list] = mapped_column(JsonType, default=list)       # порядок колонок (JSONB его не хранит)
+    meetings: Mapped[list] = mapped_column(JsonType, default=list)      # итог по каждой встрече
+    rows: Mapped[list] = mapped_column(JsonType, default=list)          # строки таблицы
+    file_name: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class ImageAnalysis(Base):
+    """Независимый разбор картинок: не связан со встречами. Сами файлы лежат в data/images."""
+
+    __tablename__ = "image_analyses"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    images: Mapped[list] = mapped_column(JsonType, default=list)        # [{file, width, height}]
+    prompt_name: Mapped[str | None] = mapped_column(String(64))         # prompts/images/<имя>; None -- свой промпт
+    system_prompt: Mapped[str] = mapped_column(Text, default="")
+    prompt: Mapped[str] = mapped_column(Text, default="")               # итоговый запрос после подстановки
+    model: Mapped[str] = mapped_column(String(128), default="")
+    tags: Mapped[list] = mapped_column(JsonType, default=list)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
     duration_ms: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

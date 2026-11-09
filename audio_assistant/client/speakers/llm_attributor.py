@@ -1,20 +1,7 @@
-"""Разметка говорящих моделью, чанками.
+"""Контекстная разметка каждой фразы; модель выбирает автора, код сохраняет текст.
 
-Правила встречи (смысл которых оценивает модель; формулировки в prompts/_tasks/speaker_attribution):
-  * нет имени -> говорит предыдущий;
-  * имя передаёт слово -> всё после него отдаётся названному, а до него остаётся предыдущему.
-
-Как это устроено, чтобы маленькая модель не портила текст и не выдумывала участников:
-  * код режет транскрипт на пронумерованные фразы, причём сразу после каждого имени (units.py), и сам
-    распознаёт имена в любых падежах;
-  * решение нужно только по фразам с именем: "кто говорит со следующей фразы" (названный / ведущий /
-    без изменений). Остальные фразы наследуют говорящего. Свободная расстановка границ целиком
-    маленькой моделью зацикливалась, а выбор из 2-3 вариантов по каждому имени она делает надёжно;
-  * ответ ограничен схемой (enum из тех, кто назван в чанке), текст собирается кодом дословно.
-
-Если всё помещается в chunk_chars, это один вызов; иначе чанки идут по порядку, и в каждый передаются
-текущий говорящий и последние размеченные фразы. Некорректный ответ по чанку -> этот чанк размечается
-правилами (NameCueAttributor), остальные остаются за моделью.
+Чанки получают предыдущие размеченные фразы и следующие фразы для контекста.
+Неполный или некорректный ответ переводит только текущий чанк на осторожные правила.
 """
 from __future__ import annotations
 
@@ -43,7 +30,10 @@ class BadModelOutput(ValueError):
 class LLMSpeakerAttributor:
     def __init__(self, llm: LLMClient, team: Team, prompts: FilePromptRepository,
                  fallback: NameCueAttributor, chunk_chars: int = 6000,
-                 context_units: int = 3, unit_max_words: int = 30):
+                 context_units: int = 12, unit_max_words: int = 30):
+        if chunk_chars < 1 or context_units < 0 or unit_max_words < 1:
+            raise ValueError("Размеры чанка и фразы должны быть положительными, контекст — неотрицательным")
+        team.validate()
         self._llm, self._team, self._prompts, self._fallback = llm, team, prompts, fallback
         self._chunk_chars, self._context_units, self._max_words = chunk_chars, context_units, unit_max_words
         self._names = NameIndex(team)
@@ -85,72 +75,59 @@ class LLMSpeakerAttributor:
             chunks.append((lo, len(units)))
         return chunks
 
-    # ── один чанк ───────────────────────────────────────────────────────
-    def _named(self, units: list[Segment], lo: int, hi: int) -> dict[int, list[str]]:
-        """Номера (с 1) фраз чанка, в которых названы участники, и кто именно."""
-        found = {i + 1: self._names.find(units[i].text) for i in range(lo, hi)}
-        return {n: names for n, names in found.items() if names}
-
     @staticmethod
     def _schema(options: list[str]) -> dict:
         return {
-            "type": "object",
+            "type": "object", "additionalProperties": False,
             "properties": {"decisions": {"type": "array", "items": {
-                "type": "object",
+                "type": "object", "additionalProperties": False,
                 "properties": {"unit": {"type": "integer"},
-                               "next_speaker": {"type": "string", "enum": options}},
-                "required": ["unit", "next_speaker"]}}},
+                               "speaker": {"type": "string", "enum": options}},
+                "required": ["unit", "speaker"]}}},
             "required": ["decisions"],
         }
 
-    def _roster(self, names: list[str]) -> str:
-        return "\n".join([f"- {HOST} (тот, кто ведёт встречу и передаёт слово)"]
-                         + [f"- {n} (в речи: {self._aliases[n]})" for n in names])
+    def _roster(self) -> str:
+        return "\n".join([f"- {HOST} (ведущий или неизвестный автор)"]
+                         + [f"- {n} (в речи: {aliases})" for n, aliases in self._aliases.items()])
 
     def _label_chunk(self, units: list[Segment], lo: int, hi: int, done: list[Segment],
                      current: str | None) -> tuple[list[str | None], str | None]:
-        """Говорящий каждой фразы чанка и говорящий ПОСЛЕ его последней фразы."""
-        named = self._named(units, lo, hi)
-        if not named:                               # имён нет -> говорящий не меняется, модель не нужна
-            return [current] * (hi - lo), current
-
         task = self._prompts.task(TASK)
-        mentioned = list(dict.fromkeys(n for names in named.values() for n in names))
-        context = "\n".join(f"- [{s.speaker or HOST}] {s.text}" for s in done[-self._context_units:]) \
-            or "(начало записи)"
+        previous = done[-self._context_units:] if self._context_units else []
+        context = "\n".join(f"- [{s.speaker or HOST}] {s.text}" for s in previous) or "(нет контекста)"
 
         def line(i: int) -> str:
-            names = named.get(i + 1)
+            names = self._names.find(units[i].text)
             return f"{i + 1}: {units[i].text}" + (f"   [названо: {', '.join(names)}]" if names else "")
 
+        # Будущие фразы помогают отличить обращение от ответа; они не размечаются этим вызовом.
+        following = "\n".join(line(i) for i in range(hi, min(len(units), hi + self._context_units)))
         user = Template(task.user_template).safe_substitute(
-            speakers=self._roster(mentioned), current_speaker=current or HOST, context=context,
-            first=lo + 1, last=hi, units="\n".join(line(i) for i in range(lo, hi)),
-            decide=", ".join(map(str, named)))
+            speakers=self._roster(), current_speaker=current or HOST, context=context,
+            following=following or "(конец записи)", first=lo + 1, last=hi,
+            units="\n".join(line(i) for i in range(lo, hi)),
+            decide=", ".join(map(str, range(lo + 1, hi + 1))))
         raw = self._llm.generate(task.system, user,
-                                 json_schema=self._schema([UNCHANGED, HOST, *mentioned]))
-        return self._labels_from(raw, lo, hi, current, named)
+                                 json_schema=self._schema([HOST, *self._aliases]))
+        return self._labels_from(raw, lo, hi)
 
-    @staticmethod
-    def _labels_from(raw: str, lo: int, hi: int, current: str | None,
-                     named: dict[int, list[str]]) -> tuple[list[str | None], str | None]:
-        """Решения модели -> (говорящий каждой фразы чанка, говорящий после последней фразы).
-
-        Решение по фразе N вступает в силу со следующей фразы. Строго: решение по фразе без имени или
-        в пользу участника, которого в этой фразе не называли, считается браком (так выглядит зацикливание)."""
+    def _labels_from(self, raw: str, lo: int, hi: int) -> tuple[list[str | None], str | None]:
         try:
-            decisions = {int(d["unit"]): d["next_speaker"] for d in json.loads(raw)["decisions"]}
+            rows = json.loads(raw)["decisions"]
+            if not isinstance(rows, list):
+                raise ValueError("decisions должен быть массивом")
+            decisions = {}
+            for row in rows:
+                number, target = row["unit"], row["speaker"]
+                if type(number) is not int or not lo < number <= hi or number in decisions:
+                    raise ValueError(f"неверный или повторный номер фразы: {number!r}")
+                if not isinstance(target, str) or target not in (HOST, *self._aliases):
+                    raise ValueError(f"неизвестный говорящий: {target!r}")
+                decisions[number] = None if target == HOST else target
+            if set(decisions) != set(range(lo + 1, hi + 1)):
+                raise ValueError("нужен автор каждой фразы чанка")
         except (ValueError, KeyError, TypeError) as exc:
             raise BadModelOutput(f"не JSON по схеме: {exc}") from exc
-        for number, target in decisions.items():
-            if number not in named:
-                raise BadModelOutput(f"решение по фразе {number} без имени (чанк {lo + 1}-{hi})")
-            if target not in (UNCHANGED, HOST, *named[number]):
-                raise BadModelOutput(f"в фразе {number} не назван {target!r}")
-        labels, speaker = [], current
-        for number in range(lo + 1, hi + 1):
-            labels.append(speaker)                  # фраза принадлежит тому, кто говорил до неё
-            target = decisions.get(number, UNCHANGED)
-            if target != UNCHANGED:
-                speaker = None if target == HOST else target
-        return labels, speaker
+        labels = [decisions[i] for i in range(lo + 1, hi + 1)]
+        return labels, labels[-1]

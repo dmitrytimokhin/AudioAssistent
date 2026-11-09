@@ -29,12 +29,33 @@ class AssistantSettings(BaseSettings):
                     "rules — только регулярные выражения по именным меткам",
     )
     attribution_chunk_chars: int = Field(
-        default=6000,
+        default=6000, ge=1,
         description="Размер чанка разметки в символах. Транскрипт короче — один вызов модели; "
                     "ориентир ~2,5 символа на токен, должно помещаться в OLLAMA max_context_length с запасом",
     )
-    attribution_context_units: int = Field(default=3, description="Сколько размеченных фраз передавать из прошлого чанка")
-    attribution_unit_max_words: int = Field(default=30, description="Максимум слов во фразе без пунктуации и имён")
+    attribution_context_units: int = Field(default=12, ge=0, description="Сколько предыдущих и следующих фраз передавать для контекста")
+    attribution_unit_max_words: int = Field(default=30, ge=1, description="Максимум слов во фразе без пунктуации и имён")
+
+    images_dir: Path = Field(default=Path("data/images"), description="Загруженные фото для разбора картинок")
+    image_max_side: int = Field(
+        default=1568, ge=256,
+        description="Длинная сторона фото в пикселях перед отправкой модели: больше -- дороже и медленнее, не точнее")
+    image_max_per_request: int = Field(default=8, ge=1, description="Сколько картинок в одном запросе к модели")
+    image_max_upload_mb: int = Field(default=25, ge=1, description="Максимальный размер одного загружаемого фото")
+    kinds_file: Path = Field(default=Path("config/meeting_kinds.yaml"), description="Типы встреч")
+    analysis_chunk_chars: int = Field(
+        default=12000,
+        description="Разбор встреч и сводки: транскрипт длиннее режется на части по этому размеру (символы), "
+                    "иначе Ollama молча отбросит не поместившееся в контекст",
+    )
+    startup_check: Literal["off", "warn", "strict"] = Field(
+        default="warn",
+        description="Проверка моделей и зависимостей при старте: warn -- в лог, strict -- не стартовать при ошибке",
+    )
+    preload_whisper: bool = Field(
+        default=True,
+        description="При старте в фоне докачать модель Whisper (иначе она качается при первой транскрибации)",
+    )
 
     transcriber_backend: Literal["mlx_whisper", "faster_whisper"] = Field(default="mlx_whisper")
     whisper_model: str | None = Field(
@@ -42,8 +63,10 @@ class AssistantSettings(BaseSettings):
         description="По умолчанию: mlx-community/whisper-large-v3-turbo (mlx) / large-v3 (faster)",
     )
     whisper_language: str = Field(default="ru")
+    whisper_beam_size: int = Field(default=5, ge=1, description="faster_whisper: 5 = точнее (умолчание), 1 = жадный поиск; на замере выигрыш небольшой")
+    whisper_cpu_threads: int = Field(default=0, ge=0, description="faster_whisper: 0 = умолчание библиотеки; больше потоков не всегда быстрее")
 
-    @field_validator("team_file", "prompts_dir", "audio_dir", "history_dir", "output_dir")
+    @field_validator("team_file", "kinds_file", "images_dir", "prompts_dir", "audio_dir", "history_dir", "output_dir")
     @classmethod
     def _absolute(cls, v: Path) -> Path:
         return v if v.is_absolute() else PROJECT_ROOT / v

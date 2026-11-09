@@ -31,6 +31,8 @@ data/audio/*
 *.[wW][eE][bB][mM]
 
 # ── Результаты и локальная история ──────────────────
+data/images/*
+!data/images/.gitkeep
 data/output/*
 !data/output/.gitkeep
 data/history/*
@@ -50,3 +52,5 @@ pgdata/
 .idea/
 .vscode/
 *.swp
+prompts/.history/
+prompts/.trash/

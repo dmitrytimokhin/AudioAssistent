@@ -32,6 +32,17 @@ class OllamaClient:
             logger.warning("Failed to list Ollama models", error=str(e))
             return []
 
+    def capabilities(self, model_name: Optional[str] = None) -> list[str]:
+        """Возможности модели по /api/show: completion, vision, thinking, tools. Пусто, если узнать не удалось."""
+        try:
+            response = requests.post(f"{self.settings.ollama_url}/api/show",
+                                     json={"model": model_name or self.settings.model_name}, timeout=10)
+            response.raise_for_status()
+            return list(response.json().get("capabilities") or [])
+        except (RequestException, ValueError) as e:
+            logger.warning("Failed to read Ollama model capabilities", error=str(e))
+            return []
+
     def has_model(self, model_name: Optional[str] = None) -> bool:
         return (model_name or self.settings.model_name) in self.list_models()
 
@@ -43,13 +54,16 @@ class OllamaClient:
         max_tokens: int,
         model_name: Optional[str] = None,
         json_schema: Optional[dict] = None,
+        images: Optional[list[str]] = None,
     ) -> str:
         """
         instruction — системный промпт (system role).
         prompt      — сообщение пользователя (user role).
+        images      — картинки в base64 (нужна модель с возможностью vision).
         Сигнатура аналогична YaLLMClient.get_generation().
         """
-        messages = [{"role": "system", "content": instruction}, {"role": "user", "content": prompt}]
+        user = {"role": "user", "content": prompt, **({"images": images} if images else {})}
+        messages = [{"role": "system", "content": instruction}, user]
         return self.chat(messages, temperature, max_tokens, model_name, json_schema)
 
     @track_external_service("ollama", "chat")

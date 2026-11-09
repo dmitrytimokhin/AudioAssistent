@@ -3,21 +3,39 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, inspect, select, text
 
 from observability.logging.setup import get_logger
 from postgres_client.client.postgres_client import PostgresClient
 
 from ..domain import DailySummary, LLMCallRecord, PersonStatus, Segment, Transcript
 from ..run_context import current_run_id
-from .models import (Base, LLMCall, MeetingRun, PersonStatusRecord, Report, SpeakerUtterance,
+from .models import (Analysis, Base, LLMCall, MeetingRun, PersonStatusRecord, Report, SpeakerUtterance,
                      TranscriptRecord)
 
 logger = get_logger(__name__)
 
 
+_ADDED_COLUMNS = {"meeting_runs": {"kind": "VARCHAR(32)", "tags": "JSON"}}   # появились после первой версии схемы
+
+
 def init_storage(client: PostgresClient) -> None:
     client.init_schema(Base)
+    _add_missing_columns(client)
+
+
+def _add_missing_columns(client: PostgresClient) -> None:
+    """create_all не меняет существующие таблицы: колонки, добавленные позже, дописываем сами."""
+    inspector = inspect(client.engine)
+    postgres = client.engine.dialect.name == "postgresql"
+    with client.engine.begin() as conn:
+        for table, columns in _ADDED_COLUMNS.items():
+            present = {c["name"] for c in inspector.get_columns(table)}
+            for name, sql_type in columns.items():
+                if name not in present:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} "
+                                      f"{'JSONB' if postgres and sql_type == 'JSON' else sql_type}"))
+                    logger.info("Column added", table=table, column=name)
 
 
 class PostgresHistoryRepository:
@@ -79,15 +97,41 @@ class PostgresRunStore:
         self._client = client
 
     # ── жизненный цикл ───────────────────────────────────────────────────
-    def start(self, day: date, source: str, recorded_at: datetime | None = None) -> int:
+    def start(self, day: date, source: str, recorded_at: datetime | None = None,
+              kind: str | None = None, tags: list[str] | None = None) -> int:
         with self._client.session() as session:
-            run = MeetingRun(meeting_date=day, source=source, recorded_at=recorded_at)
+            run = MeetingRun(meeting_date=day, source=source, recorded_at=recorded_at,
+                             kind=kind, tags=list(tags or []))
             session.add(run)
             session.commit()
             return run.id
 
     def run_day(self, run_id: int) -> date:
         return self._get_run(run_id).meeting_date
+
+    def run_info(self, run_id: int) -> dict:
+        return self._run_dict(self._get_run(run_id))
+
+    def update_meta(self, run_id: int, **fields) -> dict:
+        """Тип и теги встречи (kind, tags): меняются в любой момент, стадии не затрагивают."""
+        self._get_run(run_id)
+        self._update_run(run_id, **{k: v for k, v in fields.items() if k in ("kind", "tags")})
+        return self._run_dict(self._get_run(run_id))
+
+    def find_active(self, source: str) -> int | None:
+        """Запуск этого файла, который транскрибируется прямо сейчас (имя без учёта регистра)."""
+        with self._client.session() as session:
+            return session.scalar(select(MeetingRun.id).where(
+                MeetingRun.status == "transcribing", func.lower(MeetingRun.source) == source.lower()))
+
+    def fail_interrupted(self) -> int:
+        """На старте сервиса: транскрибация, оборванная рестартом, не должна висеть вечно."""
+        with self._client.session() as session:
+            runs = session.scalars(select(MeetingRun).where(MeetingRun.status == "transcribing")).all()
+            for run in runs:
+                run.status, run.error = "error", "Прервано перезапуском сервиса, запустите транскрибацию заново"
+            session.commit()
+            return len(runs)
 
     def set_stage(self, run_id: int | None, stage: str) -> None:
         self._update_run(run_id, status=stage, error=None)
@@ -176,7 +220,7 @@ class PostgresRunStore:
         внешний ключ SET NULL, и без этого статусы удалённой встречи остались бы в «истории»
         и попали бы в промпт следующего дня. dry_run=True только считает.
         """
-        children = [(LLMCall, "llm_calls"), (PersonStatusRecord, "person_statuses"),
+        children = [(Analysis, "analyses"), (LLMCall, "llm_calls"), (PersonStatusRecord, "person_statuses"),
                     (Report, "reports"), (SpeakerUtterance, "speaker_utterances"),
                     (TranscriptRecord, "transcripts")]
         with self._client.session() as session:
@@ -218,13 +262,51 @@ class PostgresRunStore:
     def _run_dict(r: MeetingRun) -> dict:
         return {"id": r.id, "meeting_date": r.meeting_date.isoformat(),
                 "recorded_at": r.recorded_at.isoformat() if r.recorded_at else None,
-                "source": r.source, "status": r.status, "error": r.error,
+                "source": r.source, "kind": r.kind, "tags": list(r.tags or []),
+                "status": r.status, "error": r.error,
                 "created_at": r.created_at.isoformat(), "updated_at": r.updated_at.isoformat()}
 
-    def list_runs(self, limit: int = 20) -> list[dict]:
+    def list_runs(self, limit: int | None = 20, kind: str | None = None, tag: str | None = None,
+                  date_from: date | None = None, date_to: date | None = None,
+                  kinds: list[str] | None = None, ids: list[int] | None = None,
+                  oldest_first: bool = False) -> list[dict]:
+        """Запуски с фильтрами (AND): тип, тег, период по дате встречи (включительно), список id.
+        Теги фильтруются в Python: JSON-операторы различаются между PostgreSQL и SQLite."""
+        query = select(MeetingRun)
+        if kind:
+            query = query.where(MeetingRun.kind == kind)
+        if kinds:
+            query = query.where(MeetingRun.kind.in_(kinds))
+        if date_from:
+            query = query.where(MeetingRun.meeting_date >= date_from)
+        if date_to:
+            query = query.where(MeetingRun.meeting_date <= date_to)
+        if ids:
+            query = query.where(MeetingRun.id.in_(ids))
+        query = query.order_by(MeetingRun.meeting_date, MeetingRun.id) if oldest_first \
+            else query.order_by(MeetingRun.id.desc())
         with self._client.session() as session:
-            runs = session.scalars(select(MeetingRun).order_by(MeetingRun.id.desc()).limit(limit)).all()
-            return [self._run_dict(r) for r in runs]
+            runs = [self._run_dict(r) for r in session.scalars(query)]
+        if tag:
+            runs = [r for r in runs if tag in r["tags"]]
+        return runs if limit is None else runs[:limit]
+
+    # ── разборы встреч (prompts/meetings) ────────────────────────────────
+    def save_analysis(self, run_id: int, prompt_name: str, source: str, model: str,
+                      chunks: int, text_: str) -> None:
+        self._get_run(run_id)
+        with self._client.session() as session:
+            session.execute(delete(Analysis).where(
+                Analysis.run_id == run_id, Analysis.prompt_name == prompt_name))
+            session.add(Analysis(run_id=run_id, prompt_name=prompt_name, source=source,
+                                 model=model, chunks=chunks, text=text_))
+            session.commit()
+
+    def load_analyses(self, run_id: int) -> dict[str, str]:
+        with self._client.session() as session:
+            rows = session.scalars(select(Analysis).where(Analysis.run_id == run_id)
+                                   .order_by(Analysis.id)).all()
+            return {a.prompt_name: a.text for a in rows}
 
     def detail(self, run_id: int) -> dict:
         """Всё по запуску: сырой транскрипт, диалог по говорящим, статусы и отчёты по аудиториям."""
@@ -239,6 +321,8 @@ class PostgresRunStore:
             statuses = session.scalars(select(PersonStatusRecord).where(
                 PersonStatusRecord.run_id == run_id).order_by(PersonStatusRecord.id)).all()
             reports = session.scalars(select(Report).where(Report.run_id == run_id)).all()
+            analyses = session.scalars(select(Analysis).where(Analysis.run_id == run_id)
+                                       .order_by(Analysis.id)).all()
             by_audience: dict[str, list[dict]] = {}
             for st in statuses:
                 by_audience.setdefault(st.audience, []).append(
@@ -252,7 +336,38 @@ class PostgresRunStore:
                              for u in utterances],
                 "statuses": by_audience,
                 "reports": {r.audience: r.text for r in reports},
+                "analyses": {a.prompt_name: a.text for a in analyses},
             }
+
+    # ── просмотр таблиц ──────────────────────────────────────────────────
+    @staticmethod
+    def _table(name: str):
+        table = Base.metadata.tables.get(name)
+        if table is None:
+            raise LookupError(f"Нет таблицы {name!r}. Доступны: {sorted(Base.metadata.tables)}")
+        return table
+
+    def table_counts(self) -> dict[str, int]:
+        with self._client.session() as session:
+            return {name: session.scalar(select(func.count()).select_from(t))
+                    for name, t in sorted(Base.metadata.tables.items())}
+
+    def table_rows(self, name: str, run_id: int | None = None, limit: int = 100) -> dict:
+        """Строки одной из НАШИХ таблиц (список фиксирован моделями, произвольный SQL не принимается).
+        Свежие первыми; run_id фильтрует по запуску (для meeting_runs это id)."""
+        table = self._table(name)
+        query = select(table)
+        if run_id is not None:
+            column = table.c.id if name == "meeting_runs" else table.c.get("run_id")
+            if column is None:
+                raise ValueError(f"В таблице {name} нет привязки к запуску")
+            query = query.where(column == run_id)
+        total_query = select(func.count()).select_from(query.subquery())
+        with self._client.session() as session:
+            total = session.scalar(total_query)
+            rows = session.execute(query.order_by(table.c.id.desc()).limit(limit)).mappings().all()
+        return {"table": name, "total": total, "columns": [c.name for c in table.columns],
+                "rows": [dict(r) for r in rows]}
 
 
 class PostgresCallLog:

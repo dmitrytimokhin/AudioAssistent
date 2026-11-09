@@ -1,0 +1,15 @@
+# Типы встреч. Ключ (латиницей) пишется в Postgres (meeting_runs.kind) и передаётся в API как kind.
+# title — название для людей. prompt — папка в prompts/meetings/ с промптом разбора встречи этого типа
+# (по умолчанию совпадает с ключом). Новый тип = новая строка здесь + папка prompts/meetings/<ключ>/.
+# Произвольные пометки (проект, клиент, «срочно») ставятся тегами: tags в API, без правки этого файла.
+kinds:
+  daily:
+    title: Дейли
+  one_to_one:
+    title: "1:1"
+  business_customer:
+    title: Бизнес-заказчик
+  management:
+    title: Руководство
+  other:
+    title: Другое

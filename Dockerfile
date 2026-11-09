@@ -28,9 +28,9 @@ COPY prompts prompts
 ENV PYTHONUNBUFFERED=1 \
     ASSISTANT_TRANSCRIBER_BACKEND=faster_whisper \
     ASSISTANT_AUDIO_DIR=/app/data/audio
-EXPOSE 8000
+EXPOSE 8005
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=5 \
-    CMD python -c "import urllib.request as u; u.urlopen('http://localhost:8000/healthz/liveness', timeout=2)"
+    CMD python -c "import urllib.request as u; u.urlopen('http://localhost:8005/healthz/liveness', timeout=2)"
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8005"]

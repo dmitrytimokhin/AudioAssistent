@@ -3,12 +3,14 @@ import tempfile
 from datetime import date, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
 from audio_assistant.client.domain import Transcript
 from audio_assistant.client.pipeline import Pipeline, PipelineResult
+from audio_assistant.client.run_context import get_progress
 from audio_assistant.client.recordings import (
+    AUDIO_EXTENSIONS,
     list_recordings,
     parse_recording_datetime,
     resolve_recording,
@@ -20,6 +22,8 @@ from audio_assistant.endpoint.assistant_entities import (
     AudiencesResponse,
     DeleteResponse,
     AudioFileOut,
+    LLMPromptRequest,
+    LLMPromptResponse,
     ProcessFileRequest,
     ReportResponse,
     RunDetailResponse,
@@ -30,12 +34,17 @@ from audio_assistant.endpoint.assistant_entities import (
     SummarizeRequest,
     SummarizeStageResponse,
     SummaryResponse,
+    TableRowsResponse,
+    TablesResponse,
     TranscribeRequest,
     TranscribeResponse,
+    UploadResponse,
     UtteranceOut,
 )
 from audio_assistant.endpoint.assistant_lifespan import assistant_lifespan
 from audio_assistant.endpoint.assistant_settings import get_assistant_settings
+from audio_assistant.endpoint.images_router import images_router
+from audio_assistant.endpoint.meetings_router import meetings_router
 from observability.logging.setup import get_logger
 
 logger = get_logger(__name__)
@@ -45,6 +54,11 @@ assistant_router = APIRouter(
     tags=["Audio assistant"],
     lifespan=assistant_lifespan,
 )
+
+
+# Тип встречи, разбор, сводки и проверка моделей -- в отдельном модуле, под тем же префиксом /assistant
+assistant_router.include_router(meetings_router)
+assistant_router.include_router(images_router)
 
 
 # ── общее ─────────────────────────────────────────────────────────────────
@@ -108,6 +122,17 @@ def _to_response(result: PipelineResult, day: date, audience: str, with_transcri
     )
 
 
+def _transcribe_in_background(pipeline: Pipeline, run_id: int, path: Path) -> None:
+    try:
+        pipeline.finish_transcription(run_id, path)
+    except Exception as exc:   # статус error уже записан в запуск, здесь только лог
+        logger.error("Background transcription failed", run_id=run_id, error=str(exc))
+
+
+def _split_tags(tags: str) -> list[str]:
+    return [t for t in (x.strip() for x in tags.split(",")) if t]
+
+
 def _meeting_day(explicit: date | None, recorded_at: datetime | None) -> date:
     return explicit or (recorded_at.date() if recorded_at else date.today())
 
@@ -144,18 +169,75 @@ async def assistant_audio_files():
     return list_recordings(get_assistant_settings().audio_dir)
 
 
+@assistant_router.post("/audio", response_model=UploadResponse)
+async def assistant_upload_audio(
+    req: Request,
+    file: UploadFile = File(...),
+    overwrite: bool = Form(False),
+    transcribe: bool = Form(False),
+    meeting_date: date | None = Form(None),
+    kind: str | None = Form(None),
+    tags: str = Form("", description="теги через запятую"),
+):
+    """Загрузка записи в data/audio под её именем. transcribe=true сразу запускает стадию 1
+    (kind и tags относятся к ней)."""
+    original = Path(file.filename or "").name
+    if not original or Path(original).suffix.lower() not in AUDIO_EXTENSIONS:
+        raise HTTPException(status_code=422, detail=f"Нужен аудиофайл: {sorted(AUDIO_EXTENSIONS)}")
+    audio_dir = get_assistant_settings().audio_dir
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    path = audio_dir / original
+    if path.exists() and not overwrite:
+        raise HTTPException(status_code=409, detail=f"{original} уже есть; overwrite=true заменит файл")
+    with path.open("wb") as out:
+        shutil.copyfileobj(file.file, out)
+    recorded_at = parse_recording_datetime(original)
+    response = UploadResponse(file_name=original, size_bytes=path.stat().st_size, recorded_at=recorded_at)
+    if transcribe:
+        pipeline = _get_pipeline(req)
+        day = _meeting_day(meeting_date, recorded_at)
+        response.run_id = await _call(pipeline.stage_transcribe, path, day, recorded_at, kind, _split_tags(tags))
+        response.meeting_date = day
+        response.segments = _segments_out(await _call(pipeline.store.load_raw, response.run_id))
+    logger.info("Audio uploaded", filename=original, size_bytes=response.size_bytes, run_id=response.run_id)
+    return response
+
+
 # ── отдельные стадии: каждую можно вызвать и перепроверить независимо ────────
 @assistant_router.post("/transcribe", response_model=TranscribeResponse)
-async def assistant_transcribe(body: TranscribeRequest, req: Request):
-    """Стадия 1. Файл из data/audio -> Whisper -> сырой транскрипт. Создаёт запуск (run_id)."""
+async def assistant_transcribe(body: TranscribeRequest, req: Request, background: BackgroundTasks):
+    """Стадия 1. Файл из data/audio -> Whisper -> сырой транскрипт. Создаёт запуск (run_id).
+
+    wait=true (по умолчанию) отвечает, когда транскрипт готов. wait=false отвечает сразу со статусом
+    transcribing, а работа идёт в фоне: статус и прогресс в GET /runs/{id}. Файл, который уже
+    транскрибируется, второй раз не запускается (already_running=true).
+    """
     pipeline = _get_pipeline(req)
     path = await _call(_audio_path, body.file_name)
     recorded_at = parse_recording_datetime(path.name)
     day = _meeting_day(body.meeting_date, recorded_at)
-    run_id = await _call(pipeline.stage_transcribe, path, day, recorded_at)
+    if not body.wait:
+        run_id, created = await _call(pipeline.begin_transcription, path, day, recorded_at,
+                                      body.kind, body.tags)
+        if created:
+            background.add_task(_transcribe_in_background, pipeline, run_id, path)
+        return TranscribeResponse(run_id=run_id, meeting_date=day, recorded_at=recorded_at,
+                                  status="transcribing", already_running=not created)
+    run_id = await _call(pipeline.stage_transcribe, path, day, recorded_at, body.kind, body.tags)
     raw = await _call(pipeline.store.load_raw, run_id)
     return TranscribeResponse(run_id=run_id, meeting_date=day, recorded_at=recorded_at,
                               segments=_segments_out(raw))
+
+
+@assistant_router.post("/llm", response_model=LLMPromptResponse)
+async def assistant_llm(body: LLMPromptRequest, req: Request):
+    """Свой промпт к модели поверх транскрипта запуска (или переданного текста). Не меняет статусы и отчёты;
+    вызов пишется в журнал llm_calls (audience="custom")."""
+    pipeline = _get_pipeline(req)
+    result = await _call(lambda: pipeline.run_prompt(
+        body.prompt, body.run_id, body.source, body.transcript_text, body.system, body.json_schema))
+    return LLMPromptResponse(run_id=body.run_id, source=body.source if body.run_id else None,
+                             model=result.model, duration_ms=result.duration_ms, text=result.text)
 
 
 @assistant_router.post("/runs/{run_id}/attribute", response_model=AttributeResponse)
@@ -207,11 +289,20 @@ async def assistant_process_run(run_id: int, body: StageRequest, req: Request):
 
 
 @assistant_router.get("/runs", response_model=list[RunOut])
-async def assistant_runs(req: Request, limit: int = Query(20, ge=1, le=200)):
-    """Последние запуски (только history_backend=postgres)."""
+async def assistant_runs(
+    req: Request,
+    limit: int = Query(20, ge=1, le=1000),
+    kind: str | None = Query(None, description="тип встречи"),
+    tag: str | None = Query(None, description="тег"),
+    date_from: date | None = Query(None, description="дата встречи от (включительно)"),
+    date_to: date | None = Query(None, description="дата встречи до (включительно)"),
+):
+    """Последние запуски с фильтрами по типу, тегу и периоду (только history_backend=postgres)."""
     pipeline = _get_pipeline(req)
     await _call(pipeline.require_stages)
-    return await _call(pipeline.store.list_runs, limit)
+    runs = await _call(lambda: pipeline.store.list_runs(
+        limit, kind=kind, tag=tag, date_from=date_from, date_to=date_to))
+    return [{**r, "progress": get_progress(r["id"])} for r in runs]
 
 
 @assistant_router.get("/runs/{run_id}", response_model=RunDetailResponse)
@@ -219,10 +310,25 @@ async def assistant_run_detail(run_id: int, req: Request):
     """Всё по запуску: сырой транскрипт, диалог по говорящим, статусы и отчёты по аудиториям."""
     pipeline = _get_pipeline(req)
     await _call(pipeline.require_stages)
-    return await _call(pipeline.store.detail, run_id)
+    detail = await _call(pipeline.store.detail, run_id)
+    detail["run"]["progress"] = get_progress(run_id)
+    return detail
 
 
 # ── удаление (только history_backend=postgres) ─────────────────────────────
+@assistant_router.get("/tables", response_model=TablesResponse)
+async def assistant_tables(req: Request):
+    """Сколько строк в каждой таблице Postgres."""
+    return TablesResponse(counts=await _call(_get_pipeline(req).store.table_counts))
+
+
+@assistant_router.get("/tables/{name}", response_model=TableRowsResponse)
+async def assistant_table_rows(name: str, req: Request, run_id: int | None = None,
+                               limit: int = Query(100, ge=1, le=5000)):
+    """Строки таблицы (свежие первыми), опционально по запуску. В ноутбуке: pd.DataFrame(rows)."""
+    return await _call(_get_pipeline(req).store.table_rows, name, run_id, limit)
+
+
 @assistant_router.delete("/runs/{run_id}", response_model=DeleteResponse)
 async def assistant_delete_run(run_id: int, req: Request,
                                dry_run: bool = Query(False, description="только посчитать строки")):
@@ -265,7 +371,7 @@ async def assistant_summarize(body: SummarizeRequest, req: Request):
     audience = _resolve_audience(pipeline, body.audience)
     day = body.meeting_date or date.today()
     transcript = Transcript.from_plain_text(body.text, source="api:text")
-    result = await _call(pipeline.run_transcript, transcript, audience, day, body.save)
+    result = await _call(pipeline.run_transcript, transcript, audience, day, body.save, body.kind, body.tags)
     return _to_response(result, day, audience, with_transcript=True)
 
 
@@ -277,7 +383,7 @@ async def assistant_process_file(body: ProcessFileRequest, req: Request):
     path = await _call(_audio_path, body.file_name)
     recorded_at = parse_recording_datetime(path.name)
     day = _meeting_day(body.meeting_date, recorded_at)
-    result = await _call(pipeline.run_audio, path, audience, day, body.save, recorded_at)
+    result = await _call(pipeline.run_audio, path, audience, day, body.save, recorded_at, body.kind, body.tags)
     return _to_response(result, day, audience, body.include_transcript)
 
 
@@ -289,6 +395,8 @@ async def assistant_process_audio(
     meeting_date: date | None = Form(None),
     save: bool = Form(True),
     include_transcript: bool = Form(False),
+    kind: str | None = Form(None),
+    tags: str = Form("", description="теги через запятую"),
 ):
     """Загрузка аудио -> все стадии подряд. Для записей, которых ещё нет в data/audio."""
     pipeline = _get_pipeline(req)
@@ -302,5 +410,5 @@ async def assistant_process_audio(
         with path.open("wb") as out:
             shutil.copyfileobj(file.file, out)
         logger.info("Audio received", filename=original, size_bytes=path.stat().st_size)
-        result = await _call(pipeline.run_audio, path, name, day, save, recorded_at)
+        result = await _call(pipeline.run_audio, path, name, day, save, recorded_at, kind, _split_tags(tags))
     return _to_response(result, day, name, include_transcript)

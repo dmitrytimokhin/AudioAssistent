@@ -8,11 +8,11 @@ def attribute(team, *texts):
 
 
 def test_switches_speaker_on_name_at_sentence_start(team):
-    segs = attribute(team, "Начинаем.", "Катя. Делала анализ.", "Паша, скоринг в процессе.")
+    segs = attribute(team, "Начинаем.", "Катя. Делала анализ.", "Теперь Паша. Скоринг в процессе.")
     assert [(s.speaker, s.text) for s in segs] == [
         (None, "Начинаем."),
         ("Вертоградова Екатерина", "Делала анализ."),
-        ("Зеленский Павел", "скоринг в процессе."),
+        ("Зеленский Павел", "Скоринг в процессе."),
     ]
 
 
@@ -102,3 +102,12 @@ def test_handoff_phrase_only_with_name_and_noise_safe(team):
 def test_unfinished_last_segment_is_not_lost(team):
     segs = attribute(team, "Катя. Анализ готов", "и проверен")
     assert [(s.speaker, s.text) for s in segs] == [("Вертоградова Екатерина", "Анализ готов и проверен")]
+
+
+def test_address_and_third_person_do_not_switch(team):
+    segs = attribute(team, "Роман. Паша, проверь таблицу. Катя закончила анализ. "
+                           "Спасибо Рома за помощь. Продолжаю свой отчёт.")
+    assert {s.speaker for s in segs} == {"Гончар Роман"}
+    assert "Паша, проверь таблицу." in segs[0].text
+    assert "Катя закончила анализ." in segs[0].text
+    assert "Спасибо Рома за помощь." in segs[0].text

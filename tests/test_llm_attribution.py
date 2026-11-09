@@ -75,102 +75,71 @@ def test_name_index_declensions_and_no_false_positive(team):
     assert idx.find("Катим как есть") == []
 
 
-# ── разметка ───────────────────────────────────────────────────────────────
-def test_decisions_label_text_verbatim_and_schema_is_narrowed(team):
-    units = build_units(transcript(), team)
-    at = lambda frag: index_of(units, frag)   # noqa: E731
-    llm = ScriptedLLM(decisions(
-        (at("начнем с Ромы"), "Гончар Роман"), (at("Спасибо, Рома"), HOST),
-        (at("переходим к Денису"), "Губриенко Денис"), (at("Спасибо, Денис"), HOST),
-        (at("Теперь Катя"), "Вертоградова Екатерина"), (at("спасибо катя"), UNCHANGED),
-        (at("следующий паша"), "Зеленский Павел"), (at("спасибо паша"), HOST),
-    ))
-    out = build(team, llm).attribute(transcript())
-
-    assert out.meta["chunks"] == 1 and out.meta["fallback_chunks"] == [] and len(llm.calls) == 1
-    # слова не потеряны и не изменены
-    assert " ".join(s.text for s in out.segments).split() == " ".join(r[2] for r in CPU).split()
-    by = [(s.speaker, s.text[:20]) for s in out.merge_turns().segments]
-    assert by == [
-        (None, "Раз, два, три, четыр"),
-        ("Гончар Роман", "Я сегодня сделал то-"),
-        (None, "Теперь переходим к Д"),                    # фраза с именем остаётся за прежним говорящим
-        ("Губриенко Денис", "Я сегодня провел так"),
-        (None, "Теперь Катя."),
-        ("Вертоградова Екатерина", "я ищу задачу самозан"),
-        ("Зеленский Павел", "я делаю и п вернее п"),
-        (None, "равен я заканчиваю п"),
-    ]
-
-    _, user, schema = llm.calls[0]
-    enum = schema["properties"]["decisions"]["items"]["properties"]["next_speaker"]["enum"]
-    # допустимы только «без изменений», ведущий и названные в чанке: придумать «Алексея» модель не может
-    assert enum[:2] == [UNCHANGED, HOST] and set(enum[2:]) == {
-        "Гончар Роман", "Губриенко Денис", "Вертоградова Екатерина", "Зеленский Павел"}
-    assert "[названо: Зеленский Павел]" in user and "Агафонов Алексей" not in user
-    assert "Требуется решение по фразам:" in user
+# ── контекстная разметка ───────────────────────────────────────────────────
+def labels(*names):
+    return json.dumps({"decisions": [{"unit": i, "speaker": name}
+                                    for i, name in enumerate(names, 1)]}, ensure_ascii=False)
 
 
-def test_no_names_means_no_llm_call_and_previous_speaker_stays(team):
-    llm = ScriptedLLM("не должен вызываться")
-    out = build(team, llm).attribute(Transcript([Segment(0, 1, "Сделал задачу."), Segment(1, 2, "Всё работает.")]))
-    assert llm.calls == [] and {s.speaker for s in out.segments} == {None}
+def test_contextual_interruption_and_return_without_name(team):
+    raw = Transcript([Segment(0, 1, "Начнем с Ромы. Я закончил отчёт. Паша, проверь. "
+                                    "Да, это Паша. Проверю сегодня. А я пока продолжу свой отчёт.")])
+    units = build_units(raw, team)
+    # Имена разбивают предложения, но все слова сохраняются; обращение остаётся Роману.
+    expected = [HOST, "Гончар Роман", "Гончар Роман", "Гончар Роман",
+                "Зеленский Павел", "Зеленский Павел", "Гончар Роман"]
+    assert len(units) == len(expected)
+    llm = ScriptedLLM(labels(*expected))
+    out = build(team, llm).attribute(raw)
+    assert out.meta["fallback_chunks"] == []
+    assert [s.speaker or HOST for s in out.segments] == expected
+    assert out.text.split() == raw.text.split()
+    schema = llm.calls[0][2]
+    assert "Агафонов Алексей" in schema["properties"]["decisions"]["items"]["properties"]["speaker"]["enum"]
 
 
-def test_model_omitting_decisions_changes_nobody(team):
-    out = build(team, ScriptedLLM(decisions())).attribute(transcript())
-    assert {s.speaker for s in out.segments} == {None} and out.meta["fallback_chunks"] == []
+def test_no_names_still_analyzed(team):
+    llm = ScriptedLLM(labels(HOST, HOST))
+    out = build(team, llm).attribute(Transcript([Segment(0, 1, "Задача готова. Когда релиз?")]))
+    assert len(llm.calls) == 1 and out.meta["fallback_chunks"] == []
 
 
-def test_decision_on_last_unit_of_chunk_carries_into_next_chunk(team):
-    """Регрессия: «Алексей.» последняя фраза чанка -> со следующего чанка говорит Алексей."""
-    rows = [(i, i + 1, t) for i, t in enumerate(
-        ["Начнем с Ромы.", "Сделал первую задачу.", "Сделал вторую задачу.", "Спасибо, Рома."])]
-    calls = []
-
-    def answer(user, schema):
-        calls.append(user)
-        return decisions((1, "Гончар Роман")) if len(calls) == 1 else decisions((4, HOST))
-
-    out = build(team, ScriptedLLM(answer), chunk_chars=30).attribute(Transcript([Segment(*r) for r in rows]))
-    assert out.meta["chunks"] == 4 and len(calls) == 2 and out.meta["fallback_chunks"] == []
-    assert [s.speaker for s in out.segments] == [None, "Гончар Роман", "Гончар Роман", "Гончар Роман"]
-    assert "Текущий говорящий на момент начала фрагмента: Гончар Роман" in calls[1]
-    assert "(начало записи)" in calls[0] and "[Гончар Роман] Сделал вторую задачу." in calls[1]
+def test_chunk_has_previous_and_future_context(team):
+    llm = ScriptedLLM(lambda user, schema: json.dumps({"decisions": [
+        {"unit": int(user.split("Требуется решение по фразам: ")[1].split()[0]),
+         "speaker": "Гончар Роман"}]}))
+    raw = Transcript([Segment(i, i+1, t) for i, t in enumerate(
+        ["Первый отчёт готов.", "Когда релиз?", "Продолжаю отчёт."])])
+    out = build(team, llm, chunk_chars=1, context_units=1).attribute(raw)
+    assert out.meta["fallback_chunks"] == [] and len(llm.calls) == 3
+    assert "2: Когда релиз?" in llm.calls[0][1]
+    assert "[Гончар Роман] Первый отчёт готов." in llm.calls[1][1]
+    assert "3: Продолжаю отчёт." in llm.calls[1][1]
 
 
-@pytest.mark.parametrize("bad", [
-    "не json",
-    '{"x": 1}',
-    '{"decisions": [{"unit": 3, "next_speaker": "ведущий"}]}',                 # решение по фразе без имени
-    '{"decisions": [{"unit": 1, "next_speaker": "Зеленский Павел"}]}',         # в этой фразе его не называли
-    '{"decisions": [{"unit": 99, "next_speaker": "ведущий"}]}',                # вне чанка
-])
-def test_bad_model_output_falls_back_to_rules_for_that_chunk(team, bad):
+@pytest.mark.parametrize("bad", ["не json", '{"x": 1}', '{"decisions": []}',
+    '{"decisions": [{"unit": 1, "speaker": "чужой"}]}',
+    '{"decisions": [{"unit": 99, "speaker": "ведущий"}]}',
+    '{"decisions": [{"unit": true, "speaker": "ведущий"}]}',
+    '{"decisions": [{"unit": 1, "speaker": "ведущий"}, {"unit": 1, "speaker": "ведущий"}]}'])
+def test_bad_model_output_falls_back(team, bad):
     out = build(team, ScriptedLLM(bad)).attribute(transcript())
     assert out.meta["fallback_chunks"] == [1]
-    # правила дают верную раскладку по реальной записи
-    assert {s.speaker for s in out.segments} >= {"Гончар Роман", "Губриенко Денис",
-                                                  "Вертоградова Екатерина", "Зеленский Павел"}
+    assert "Гончар Роман" in {s.speaker for s in out.segments}
 
 
-def test_llm_exception_falls_back_only_failed_chunk(team):
-    rows = [(i, i + 1, t) for i, t in enumerate(
-        ["Начнем с Ромы.", "Сделал первую задачу.", "Теперь Катя.", "Сделала вторую задачу."])]
-    state = {"n": 0}
-
+def test_exception_fallback_keeps_current_speaker(team):
+    count = 0
     def answer(user, schema):
-        state["n"] += 1
-        if state["n"] == 2:
-            raise TimeoutError("ollama timeout")
-        return decisions((1, "Гончар Роман"))
-
-    out = build(team, ScriptedLLM(answer), chunk_chars=30).attribute(Transcript([Segment(*r) for r in rows]))
-    assert out.meta["fallback_chunks"] == [3]
-    # правила продолжили с текущего говорящего (Роман) и передали слово Кате; чанк 4 без имён унаследовал её
-    assert [(s.speaker, s.text) for s in out.segments] == [
-        (None, "Начнем с Ромы."), ("Гончар Роман", "Сделал первую задачу."),
-        ("Вертоградова Екатерина", "Сделала вторую задачу.")]
+        nonlocal count
+        count += 1
+        if count == 2:
+            raise TimeoutError("timeout")
+        return labels("Гончар Роман")
+    out = build(team, ScriptedLLM(answer), chunk_chars=1).attribute(
+        Transcript([Segment(0, 1, "Мой отчёт готов."), Segment(1, 2, "Паша, проверь.")]))
+    assert out.meta["fallback_chunks"] == [2, 3]
+    assert {s.speaker for s in out.segments} == {"Гончар Роман"}
 
 
 # ── пайплайн, адаптер, клиент ──────────────────────────────────────────────

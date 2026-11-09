@@ -8,6 +8,7 @@
     python scripts/process_audio.py --all-new                # все записи, для которых ещё нет результата
     python scripts/process_audio.py --replace                # сначала удалить прошлые запуски этого файла
     python scripts/process_audio.py --attribution rules      # разметка говорящих правилами вместо модели
+    python scripts/process_audio.py --kind daily --tag 'проект 3924'   # тип и теги встречи (пишутся в Postgres)
 
 Для каждой записи пишет в --out (по умолчанию data/output):
     <имя файла>.dialogue.txt          диалог по говорящим
@@ -57,7 +58,7 @@ def dialogue_text(dialogue: list[dict]) -> str:
 
 
 def process(base: str, file_name: str, audiences: list[str], out: Path, replace: bool,
-            attribution: str | None) -> None:
+            attribution: str | None, kind: str | None = None, tags: list[str] | None = None) -> None:
     stem = Path(file_name).stem
     started = time.perf_counter()
     if replace:
@@ -66,7 +67,7 @@ def process(base: str, file_name: str, audiences: list[str], out: Path, replace:
             print(f"  удалены прошлые запуски: {r['run_ids']}")
 
     print(f"  [1/3] транскрибация {file_name} ...", flush=True)
-    t = call(base, "POST", "/assistant/transcribe", {"file_name": file_name})
+    t = call(base, "POST", "/assistant/transcribe", {"file_name": file_name, "kind": kind, "tags": tags or []})
     run_id = t["run_id"]
 
     out.mkdir(parents=True, exist_ok=True)
@@ -93,7 +94,9 @@ def main() -> int:
     ap.add_argument("--replace", action="store_true", help="удалить прошлые запуски этого файла перед обработкой")
     ap.add_argument("--attribution", choices=("llm", "rules"),
                     help="разметка говорящих: llm (модель, чанками) или rules; по умолчанию из настроек сервиса")
-    ap.add_argument("--url", default=os.getenv("ASSISTANT_URL", "http://localhost:8000"))
+    ap.add_argument("--kind", help="тип встречи: daily, one_to_one, ... (config/meeting_kinds.yaml)")
+    ap.add_argument("--tag", action="append", default=[], help="тег встречи; повторяемый")
+    ap.add_argument("--url", default=os.getenv("ASSISTANT_URL", "http://localhost:8005"))
     ap.add_argument("--out", type=Path, default=ROOT / "data" / "output")
     args = ap.parse_args()
     base = args.url.rstrip("/")
@@ -115,7 +118,7 @@ def main() -> int:
 
     for name in todo:
         print(f"{name}:")
-        process(base, name, audiences, args.out, args.replace, args.attribution)
+        process(base, name, audiences, args.out, args.replace, args.attribution, args.kind, args.tag)
     return 0
 
 

@@ -1,6 +1,7 @@
 """Подключение ollama_client к порту LLMClient + журналирование вызовов."""
 from __future__ import annotations
 
+import base64
 import time
 
 from observability.logging.setup import get_logger
@@ -23,7 +24,8 @@ class OllamaLLMAdapter:
     # Структурированные ответы (разметка говорящих) длиннее обычного статуса
     STRUCTURED_MIN_TOKENS = 2048
 
-    def generate(self, system: str, user: str, json_schema: dict | None = None) -> str:
+    def generate(self, system: str, user: str, json_schema: dict | None = None,
+                 images: list[bytes] | None = None) -> str:
         # Ollama может быть недоступна на старте: коннект проверяется лениво
         if not self._client.is_connected and not self._client.connect():
             raise RuntimeError("Ollama unavailable")
@@ -31,6 +33,7 @@ class OllamaLLMAdapter:
         return self._client.query(
             instruction=system, prompt=user, temperature=self._temperature,
             max_tokens=max_tokens, model_name=self.model_name, json_schema=json_schema,
+            images=[base64.b64encode(i).decode() for i in images] if images else None,
         )
 
 
@@ -41,18 +44,20 @@ class LoggedLLMClient:
         self._inner, self._call_log = inner, call_log
         self._model = model_name or getattr(inner, "model_name", "")
 
-    def generate(self, system: str, user: str, json_schema: dict | None = None) -> str:
+    def generate(self, system: str, user: str, json_schema: dict | None = None,
+                 images: list[bytes] | None = None) -> str:
         started = time.perf_counter()
         response, error = None, None
+        extra = {k: v for k, v in (("json_schema", json_schema), ("images", images)) if v}
         try:
-            response = (self._inner.generate(system, user) if json_schema is None
-                        else self._inner.generate(system, user, json_schema=json_schema))
+            response = self._inner.generate(system, user, **extra)   # узкие LLM-заглушки не знают лишних параметров
             return response
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
-            self._record(system, user, response, error, started)
+            logged_user = f"{user}\n[изображений: {len(images)}]" if images else user
+            self._record(system, logged_user, response, error, started)
 
     def _record(self, system: str, user: str, response: str | None, error: str | None,
                 started: float) -> None:

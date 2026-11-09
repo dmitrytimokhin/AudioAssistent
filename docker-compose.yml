@@ -25,10 +25,10 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "8005:8005"
     environment:
       POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
+      POSTGRES_PORT: "5432"   # внутри сети compose; порт хоста из .env сюда не относится
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-audio}
@@ -39,6 +39,9 @@ services:
       ASSISTANT_DEFAULT_AUDIENCE: ${ASSISTANT_DEFAULT_AUDIENCE:-management}
       ASSISTANT_ATTRIBUTION_METHOD: ${ASSISTANT_ATTRIBUTION_METHOD:-llm}
       ASSISTANT_ATTRIBUTION_CHUNK_CHARS: ${ASSISTANT_ATTRIBUTION_CHUNK_CHARS:-6000}
+      ASSISTANT_STARTUP_CHECK: ${ASSISTANT_STARTUP_CHECK:-warn}      # off | warn | strict (strict: не стартовать, если модель недоступна)
+      ASSISTANT_PRELOAD_WHISPER: ${ASSISTANT_PRELOAD_WHISPER:-true}  # докачать модель Whisper в фоне при старте
+      ASSISTANT_WHISPER_BEAM_SIZE: ${ASSISTANT_WHISPER_BEAM_SIZE:-5}   # 1 = быстрее на CPU, чуть менее точно
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     extra_hosts:
       - "host.docker.internal:host-gateway"   # на Linux; Docker Desktop знает это имя сам

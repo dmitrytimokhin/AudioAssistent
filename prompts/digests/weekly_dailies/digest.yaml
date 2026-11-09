@@ -1,0 +1,5 @@
+title: Дейлики за период
+kinds: [daily]
+source: dialogue
+meta_columns: [date]
+columns: [Сотрудник, Проект, Сделано, Планы, Блокеры]

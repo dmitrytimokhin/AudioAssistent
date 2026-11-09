@@ -17,8 +17,10 @@ class SpeakerAttributor(Protocol):
 
 
 class LLMClient(Protocol):
-    def generate(self, system: str, user: str, json_schema: dict | None = None) -> str:
-        """json_schema задан -> ответ строго по схеме (структурированный вывод)."""
+    def generate(self, system: str, user: str, json_schema: dict | None = None,
+                 images: list[bytes] | None = None) -> str:
+        """json_schema задан -> ответ строго по схеме (структурированный вывод).
+        images -- готовые к отправке байты картинок (модель должна уметь vision)."""
         ...
 
 
@@ -39,9 +41,21 @@ class RunStore(Protocol):
 
     supports_stages: bool
 
-    def start(self, day: date, source: str, recorded_at: datetime | None = None) -> int | None: ...
+    def start(self, day: date, source: str, recorded_at: datetime | None = None,
+              kind: str | None = None, tags: list[str] | None = None) -> int | None: ...
 
     def run_day(self, run_id: int) -> date: ...
+
+    def run_info(self, run_id: int) -> dict: ...
+
+    def update_meta(self, run_id: int, **fields) -> dict: ...
+
+    def list_runs(self, limit: int | None = 20, **filters) -> list[dict]: ...
+
+    def save_analysis(self, run_id: int, prompt_name: str, source: str, model: str,
+                      chunks: int, text_: str) -> None: ...
+
+    def find_active(self, source: str) -> int | None: ...
 
     def save_raw(self, run_id: int | None, transcript: Transcript) -> None: ...
 
@@ -71,13 +85,21 @@ class NullRunStore:
 
     supports_stages = False
 
-    def start(self, day: date, source: str, recorded_at: datetime | None = None) -> int | None:
+    def start(self, day: date, source: str, recorded_at: datetime | None = None,
+              kind: str | None = None, tags: list[str] | None = None) -> int | None:
         return None
 
-    def run_day(self, run_id: int) -> date:
+    def run_day(self, *args, **kwargs):
         raise NotImplementedError("Стадии требуют ASSISTANT_HISTORY_BACKEND=postgres")
 
-    load_raw = load_attributed = run_day
+    load_raw = load_attributed = find_active = run_info = update_meta = run_day
+    list_runs = save_analysis = run_day
+
+    def table_counts(self) -> dict:
+        raise NotImplementedError("Просмотр таблиц требует ASSISTANT_HISTORY_BACKEND=postgres")
+
+    def table_rows(self, *args, **kwargs) -> dict:
+        return self.table_counts()
 
     def delete(self, **kwargs) -> dict:
         raise NotImplementedError("Удаление требует ASSISTANT_HISTORY_BACKEND=postgres")

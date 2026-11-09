@@ -89,7 +89,7 @@ def test_pipeline_marks_run_failed_when_transcription_breaks(team, tmp_path):
         supports_stages = True
 
         def __init__(self): self.events = []
-        def start(self, day, source, recorded_at=None): self.events.append("start"); return 7
+        def start(self, day, source, recorded_at=None, kind=None, tags=None): self.events.append("start"); return 7
         def save_raw(self, run_id, transcript): self.events.append("raw")
         def save_attributed(self, run_id, transcript): self.events.append("attributed")
         def set_stage(self, run_id, stage): self.events.append(stage)

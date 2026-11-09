@@ -1,0 +1,5 @@
+header: "Дейли {date}"
+project_header: "Проект {project}:"
+item: "{index}. {full_name} - {text}"
+date_format: "%d.%m.%Y"
+empty_text: "нет обновлений"
